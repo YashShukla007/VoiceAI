@@ -2,10 +2,11 @@ import asyncio
 import logging
 from typing import Dict, Set
 from fastapi import WebSocket
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.exc import IntegrityError
 from .db import async_session
 from . import models, ai_service
+from sqlalchemy.dialects.postgresql import insert
 
 logger = logging.getLogger("voiceai")
 
@@ -36,35 +37,64 @@ ws_manager = WSManager()
 
 
 async def handle_packet(call_id: str, packet: dict):
-    # Lightweight: insert packet and check ordering, log warning if hole
     async with async_session() as session:
         async with session.begin():
-            # ensure call exists
-            res = await session.execute(select(models.Call).where(models.Call.id == call_id))
-            call = res.scalars().first()
-            if not call:
-                call = models.Call(id=call_id, state=models.CallState.IN_PROGRESS.value, last_sequence=None)
-                session.add(call)
-                await session.flush()
+
+            # 1️⃣ Ensure call exists (UPSERT — concurrency safe)
+            stmt = (
+                insert(models.Call)
+                .values(
+                    id=call_id,
+                    state=models.CallState.IN_PROGRESS.value,
+                    last_sequence=None,
+                )
+                .on_conflict_do_nothing(index_elements=["id"])
+            )
+            await session.execute(stmt)
 
             seq = packet["sequence"]
-            # check for missing packet
-            if call.last_sequence is not None and seq != call.last_sequence + 1:
-                logger.warning(f"Packet out of order or missing for {call_id}: got {seq}, last {call.last_sequence}")
 
-            pkt = models.Packet(call_id=call_id, sequence=seq, data=packet["data"], timestamp=packet["timestamp"]) 
+            # 2️⃣ Insert packet (ignore duplicates)
+            pkt = models.Packet(
+                call_id=call_id,
+                sequence=seq,
+                data=packet["data"],
+                timestamp=packet["timestamp"],
+            )
+
             try:
                 session.add(pkt)
-                # update last_sequence if higher
-                if call.last_sequence is None or seq > call.last_sequence:
-                    call.last_sequence = seq
                 await session.flush()
             except IntegrityError:
                 await session.rollback()
                 logger.info(f"Duplicate packet {seq} for {call_id}")
+                return  # no need to continue
 
-    await ws_manager.broadcast(call_id, f"packet_received:{packet['sequence']}")
+            # 3️⃣ Atomically update last_sequence (only if higher)
+            await session.execute(
+                models.Call.__table__
+                .update()
+                .where(
+                    models.Call.id == call_id,
+                    func.coalesce(models.Call.last_sequence, -1) < seq
+                )
+                .values(last_sequence=seq)
+            )
 
+            # 4️⃣ Optional: detect gaps (read AFTER update)
+            res = await session.execute(
+                select(models.Call.last_sequence)
+                .where(models.Call.id == call_id)
+            )
+            last_seq = res.scalar_one()
+
+            if last_seq is not None and seq != last_seq:
+                logger.warning(
+                    f"Packet out of order or missing for {call_id}: got {seq}, last {last_seq}"
+                )
+
+    # 5️⃣ Notify listeners (outside transaction)
+    await ws_manager.broadcast(call_id, f"packet_received:{seq}")
 
 async def process_call_ai(call_id: str):
     # Aggregate data and call AI service with retries. Update call state accordingly.

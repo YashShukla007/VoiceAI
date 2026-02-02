@@ -6,15 +6,15 @@ create voiceai DB in it
 
 # Steps to run the program
 
-```bash
+```Powershell
 python -m venv .venv
-source .venv/bin/activate
+.venv\Scripts\activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
 
 Tests:
 
-```bash
-pytest -q
+```Powershell
+pytest
 ```
