@@ -1,0 +1,33 @@
+import asyncio
+import pytest
+from httpx import AsyncClient, ASGITransport
+
+from app.main import app
+
+
+@pytest.mark.asyncio
+async def test_concurrent_packets_no_crash():
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test"
+    ) as ac:
+
+        call_id = "test-call-7"
+
+        packet1 = {"sequence": 1, "data": "hello", "timestamp": 1.0}
+        packet2 = {"sequence": 2, "data": "hello-duplicate", "timestamp": 1.0}
+        test = {}
+
+        r1, r2 = await asyncio.gather(
+            ac.post(f"/v1/call/stream/{call_id}", json=packet1),
+            ac.post(f"/v1/call/stream/{call_id}", json=packet2),
+        )
+
+        r3 = await asyncio.gather(
+            ac.post(f"/v1/call/{call_id}/complete", json=test)
+        )
+
+        assert r1.status_code == 202
+        assert r2.status_code == 202
